@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <meta name="description" content="A limited 13-slot TON giveaway. Submit your TON wallet address to participate.">
+  <title>TON Drop — Limited Giveaway</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="TON Drop home">
+      <span class="ton-mark">◆</span><span>TON<span class="brand-light">DROP</span></span>
+    </a>
+    <span class="live"><i></i> COMMUNITY GIVEAWAY</span>
+  </header>
+
+  <main class="wrap">
+    <section class="hero">
+      <div class="eyebrow"><span class="spark">✦</span> A LITTLE DROP. A BIG THANK YOU.</div>
+      <h1>Your TON moment<br><span>starts here.</span></h1>
+      <p class="intro">A limited community giveaway. Submit your TON wallet address for a chance to receive the stated reward. Only 13 entries are accepted.</p>
+
+      <div class="reward-card">
+        <div class="coin-wrap"><div class="coin">◆</div></div>
+        <div class="reward-copy">
+          <span class="muted-label">REWARD PER ACCEPTED ENTRY</span>
+          <div class="amount">0.052 <span>TON</span></div>
+          <span class="small-note">Sent manually by the giveaway organizer</span>
+        </div>
+        <div class="limited"><span class="limited-dot"></span> LIMITED</div>
+      </div>
+
+      <div class="progress-panel">
+        <div class="progress-head">
+          <div><span class="muted-label">SLOTS CLAIMED</span><div class="progress-count"><strong id="claimed">—</strong><span> / 13</span></div></div>
+          <span class="slots-left" id="remaining">Checking slots…</span>
+        </div>
+        <div class="track"><div id="progress" class="progress-fill"></div></div>
+        <div class="progress-foot"><span>First valid entries</span><span id="progress-percent">—</span></div>
+      </div>
+
+      <section class="form-card" id="claim-card">
+        <div class="form-title"><span class="step-number">01</span><div><h2>Enter the giveaway</h2><p>No account or personal details needed.</p></div></div>
+        <form id="claim-form" novalidate>
+          <label for="address">Your TON wallet address</label>
+          <div class="input-wrap"><span class="input-icon">◈</span><input id="address" name="address" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your TON address" maxlength="100" required><button type="button" id="clear-address" class="clear-btn" aria-label="Clear address">×</button></div>
+          <p class="field-hint">Use a wallet address you control. Never enter your seed phrase or private key.</p>
+          <button id="submit-btn" class="submit-btn" type="submit"><span>Claim my slot</span><span aria-hidden="true">↗</span></button>
+          <div id="notice" class="notice" role="status" aria-live="polite"></div>
+        </form>
+        <div class="full-state" id="full-state" hidden>
+          <div class="full-icon">✓</div><h2>Reward Fully Claimed</h2><p>All 13 giveaway slots have been filled. Thanks for stopping by.</p>
+        </div>
+      </section>
+
+      <div class="trust-row">
+        <div><span class="trust-icon">⌁</span><span>13 slots only</span></div>
+        <div><span class="trust-icon">◈</span><span>One entry per wallet</span></div>
+        <div><span class="trust-icon">↗</span><span>Manual payout</span></div>
+      </div>
+      <p class="disclaimer">Submitting an address does not send or connect your wallet. Never share your seed phrase, private key, or sign an unfamiliar transaction. The organizer sends any reward manually; submission alone is not proof of payment.</p>
+    </section>
+  </main>
+  <footer><a class="brand footer-brand" href="/"><span class="ton-mark">◆</span><span>TON<span class="brand-light">DROP</span></span></a><span>Community giveaway · 13 slots</span></footer>
+</body>
+            </html>
+            
