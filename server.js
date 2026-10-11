@@ -7,6 +7,7 @@ const rateLimit = require("express-rate-limit");
 const path = require("path");
 const { Pool } = require("pg");
 const { Address } = require("@ton/core");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -18,7 +19,10 @@ if (!process.env.DATABASE_URL) {
 }
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes("localhost")
+    ? false
+    : { rejectUnauthorized: false }
 });
 
 app.use(helmet({
@@ -35,7 +39,6 @@ app.use(helmet({
 }));
 
 app.use(express.json({ limit: "3kb" }));
-app.use(express.static(path.join(__dirname, "public")));
 
 app.use("/api/", rateLimit({
   windowMs: 60 * 1000,
@@ -44,9 +47,71 @@ app.use("/api/", rateLimit({
   legacyHeaders: false
 }));
 
+// Protect the admin page from public access.
+app.get("/admin/claims", async (req, res) => {
+  const username = process.env.ADMIN_USER;
+  const password = process.env.ADMIN_PASSWORD;
+
+  if (!username || !password) {
+    return res.status(503).send(
+      "Admin access is not configured in environment variables."
+    );
+  }
+
+  const header = req.headers.authorization || "";
+  const match = header.match(/^Basic\s+(.+)$/i);
+
+  if (!match) {
+    res.set("WWW-Authenticate", 'Basic realm="TON Claims"');
+    return res.status(401).send("Admin login required.");
+  }
+
+  let supplied;
+  try {
+    supplied = Buffer.from(match[1], "base64").toString("utf8");
+  } catch {
+    return res.status(401).send("Invalid login.");
+  }
+
+  const separator = supplied.indexOf(":");
+  const suppliedUser = separator >= 0 ? supplied.slice(0, separator) : "";
+  const suppliedPass = separator >= 0 ? supplied.slice(separator + 1) : "";
+
+  const userOK = suppliedUser === username;
+  const passOK = suppliedPass.length === password.length &&
+    crypto.timingSafeEqual(
+      Buffer.from(suppliedPass),
+      Buffer.from(password)
+    );
+
+  if (!userOK || !passOK) {
+    res.set("WWW-Authenticate", 'Basic realm="TON Claims"');
+    return res.status(401).send("Incorrect username or password.");
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT id, address, created_at FROM claims ORDER BY id ASC"
+    );
+
+    res.set("Cache-Control", "no-store");
+    return res.json({
+      total: result.rowCount,
+      claims: result.rows
+    });
+  } catch (error) {
+    console.error("Claims retrieval failed:", error.message);
+    return res.status(500).send("Could not retrieve claims.");
+  }
+});
+
+app.use(express.static(path.join(__dirname, "public")));
+
 app.get("/api/status", async (req, res) => {
   try {
-    const result = await pool.query("SELECT COUNT(*)::int AS count FROM claims");
+    const result = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM claims"
+    );
     const count = result.rows[0].count;
 
     res.json({
@@ -58,7 +123,9 @@ app.get("/api/status", async (req, res) => {
     });
   } catch (error) {
     console.error("Status database error:", error.message);
-    res.status(503).json({ error: "Giveaway status temporarily unavailable." });
+    res.status(503).json({
+      error: "Giveaway status temporarily unavailable."
+    });
   }
 });
 
@@ -67,7 +134,7 @@ async function notifyTelegram(address, slot) {
   const chatId = process.env.ADMIN_CHAT_ID;
 
   if (!token || !chatId) {
-    console.error("Telegram notification is not configured.");
+    console.error("Telegram BOT_TOKEN or ADMIN_CHAT_ID is missing.");
     return false;
   }
 
@@ -84,14 +151,20 @@ async function notifyTelegram(address, slot) {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text: message })
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message
+        })
       }
     );
 
     const result = await response.json();
 
     if (!response.ok || !result.ok) {
-      console.error("Telegram notification failed:", result.description || response.status);
+      console.error(
+        "Telegram notification failed:",
+        result.description || response.status
+      );
       return false;
     }
 
@@ -128,13 +201,12 @@ app.post("/api/claim", async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
+  let client;
   let outcome;
 
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
-
-    // Serialize claims so two visitors cannot take the same final slot.
     await client.query("SELECT pg_advisory_xact_lock($1)", [130013]);
 
     const existing = await client.query(
@@ -149,9 +221,7 @@ app.post("/api/claim", async (req, res) => {
         "SELECT COUNT(*)::int AS count FROM claims"
       );
 
-      const count = countResult.rows[0].count;
-
-      if (count >= LIMIT) {
+      if (countResult.rows[0].count >= LIMIT) {
         outcome = { type: "full" };
       } else {
         const inserted = await client.query(
@@ -166,22 +236,24 @@ app.post("/api/claim", async (req, res) => {
       }
     }
 
-    if (outcome.type !== "accepted") {
-      await client.query("ROLLBACK");
-    } else {
+    if (outcome.type === "accepted") {
       await client.query("COMMIT");
+    } else {
+      await client.query("ROLLBACK");
     }
   } catch (error) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+    }
 
     console.error("Claim database error:", error.message);
     return res.status(500).json({
       error: "Something went wrong. Please try again shortly."
     });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 
   if (outcome.type === "duplicate") {
@@ -197,14 +269,20 @@ app.post("/api/claim", async (req, res) => {
     });
   }
 
+  // The claim is saved even if Telegram notification fails.
   notifyTelegram(canonical, outcome.slot).then(ok => {
     if (!ok) {
-      console.error("Claim saved but Telegram notification needs checking. Slot:", outcome.slot);
+      console.error(
+        "Claim saved but Telegram notification needs checking. Slot:",
+        outcome.slot
+      );
     }
   });
 
   try {
-    const result = await pool.query("SELECT COUNT(*)::int AS count FROM claims");
+    const result = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM claims"
+    );
     const count = result.rows[0].count;
 
     return res.status(201).json({
@@ -249,4 +327,3 @@ start().catch(error => {
   console.error("Server startup failed:", error.message);
   process.exit(1);
 });
-  
