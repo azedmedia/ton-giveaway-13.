@@ -5,14 +5,21 @@ const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const path = require("path");
-const fs = require("fs");
-const Database = require("better-sqlite3");
+const { Pool } = require("pg");
 const { Address } = require("@ton/core");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const LIMIT = 13;
 const REWARD = "0.052 TON";
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is missing from environment variables.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
 
 app.use(helmet({
   contentSecurityPolicy: {
@@ -30,21 +37,6 @@ app.use(helmet({
 app.use(express.json({ limit: "3kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const dataDir = path.join(__dirname, "data");
-fs.mkdirSync(dataDir, { recursive: true });
-
-const db = new Database(path.join(dataDir, "giveaway.sqlite"));
-db.pragma("journal_mode = WAL");
-db.pragma("busy_timeout = 5000");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS claims (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    address TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-`);
-
 app.use("/api/", rateLimit({
   windowMs: 60 * 1000,
   limit: 20,
@@ -52,16 +44,22 @@ app.use("/api/", rateLimit({
   legacyHeaders: false
 }));
 
-app.get("/api/status", (req, res) => {
-  const count = db.prepare("SELECT COUNT(*) AS count FROM claims").get().count;
+app.get("/api/status", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT COUNT(*)::int AS count FROM claims");
+    const count = result.rows[0].count;
 
-  res.json({
-    claimed: count,
-    total: LIMIT,
-    remaining: Math.max(0, LIMIT - count),
-    full: count >= LIMIT,
-    reward: REWARD
-  });
+    res.json({
+      claimed: count,
+      total: LIMIT,
+      remaining: Math.max(0, LIMIT - count),
+      full: count >= LIMIT,
+      reward: REWARD
+    });
+  } catch (error) {
+    console.error("Status database error:", error.message);
+    res.status(503).json({ error: "Giveaway status temporarily unavailable." });
+  }
 });
 
 async function notifyTelegram(address, slot) {
@@ -69,7 +67,7 @@ async function notifyTelegram(address, slot) {
   const chatId = process.env.ADMIN_CHAT_ID;
 
   if (!token || !chatId) {
-    console.error("Telegram notification is not configured. Check BOT_TOKEN and ADMIN_CHAT_ID.");
+    console.error("Telegram notification is not configured.");
     return false;
   }
 
@@ -86,20 +84,14 @@ async function notifyTelegram(address, slot) {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: message
-        })
+        body: JSON.stringify({ chat_id: chatId, text: message })
       }
     );
 
     const result = await response.json();
 
     if (!response.ok || !result.ok) {
-      console.error(
-        "Telegram notification failed:",
-        result.description || response.status
-      );
+      console.error("Telegram notification failed:", result.description || response.status);
       return false;
     }
 
@@ -111,11 +103,10 @@ async function notifyTelegram(address, slot) {
   }
 }
 
-app.post("/api/claim", (req, res) => {
-  const raw =
-    typeof req.body?.address === "string"
-      ? req.body.address.trim()
-      : "";
+app.post("/api/claim", async (req, res) => {
+  const raw = typeof req.body?.address === "string"
+    ? req.body.address.trim()
+    : "";
 
   if (!raw || raw.length > 100) {
     return res.status(400).json({
@@ -137,43 +128,60 @@ app.post("/api/claim", (req, res) => {
     });
   }
 
-  const claim = db.transaction((address) => {
-    const existing = db
-      .prepare("SELECT id FROM claims WHERE address = ?")
-      .get(address);
-
-    if (existing) {
-      return { type: "duplicate" };
-    }
-
-    const count = db
-      .prepare("SELECT COUNT(*) AS count FROM claims")
-      .get().count;
-
-    if (count >= LIMIT) {
-      return { type: "full" };
-    }
-
-    const result = db
-      .prepare("INSERT INTO claims (address) VALUES (?)")
-      .run(address);
-
-    return {
-      type: "accepted",
-      slot: Number(result.lastInsertRowid)
-    };
-  });
-
+  const client = await pool.connect();
   let outcome;
 
   try {
-    outcome = claim.immediate(canonical);
-  } catch (error) {
-    console.error("Database error:", error.message);
+    await client.query("BEGIN");
 
+    // Serialize claims so two visitors cannot take the same final slot.
+    await client.query("SELECT pg_advisory_xact_lock($1)", [130013]);
+
+    const existing = await client.query(
+      "SELECT id FROM claims WHERE address = $1",
+      [canonical]
+    );
+
+    if (existing.rowCount > 0) {
+      outcome = { type: "duplicate" };
+    } else {
+      const countResult = await client.query(
+        "SELECT COUNT(*)::int AS count FROM claims"
+      );
+
+      const count = countResult.rows[0].count;
+
+      if (count >= LIMIT) {
+        outcome = { type: "full" };
+      } else {
+        const inserted = await client.query(
+          "INSERT INTO claims (address) VALUES ($1) RETURNING id",
+          [canonical]
+        );
+
+        outcome = {
+          type: "accepted",
+          slot: Number(inserted.rows[0].id)
+        };
+      }
+    }
+
+    if (outcome.type !== "accepted") {
+      await client.query("ROLLBACK");
+    } else {
+      await client.query("COMMIT");
+    }
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+
+    console.error("Claim database error:", error.message);
     return res.status(500).json({
       error: "Something went wrong. Please try again shortly."
     });
+  } finally {
+    client.release();
   }
 
   if (outcome.type === "duplicate") {
@@ -189,33 +197,56 @@ app.post("/api/claim", (req, res) => {
     });
   }
 
-  // Notify Telegram using the exact canonical address saved for this claim.
-  notifyTelegram(canonical, outcome.slot).then((ok) => {
+  notifyTelegram(canonical, outcome.slot).then(ok => {
     if (!ok) {
-      console.error(
-        "Claim saved but Telegram notification needs checking. Slot:",
-        outcome.slot
-      );
+      console.error("Claim saved but Telegram notification needs checking. Slot:", outcome.slot);
     }
   });
 
-  const count = db
-    .prepare("SELECT COUNT(*) AS count FROM claims")
-    .get().count;
+  try {
+    const result = await pool.query("SELECT COUNT(*)::int AS count FROM claims");
+    const count = result.rows[0].count;
 
-  return res.status(201).json({
-    success: true,
-    slot: outcome.slot,
-    total: LIMIT,
-    remaining: Math.max(0, LIMIT - count),
-    message: "Your wallet address has been submitted. Payouts are manual; no TON has been sent automatically."
-  });
+    return res.status(201).json({
+      success: true,
+      slot: outcome.slot,
+      total: LIMIT,
+      remaining: Math.max(0, LIMIT - count),
+      message: "Your wallet address has been submitted. Payouts are manual; no TON has been sent automatically."
+    });
+  } catch (error) {
+    console.error("Claim count error:", error.message);
+    return res.status(201).json({
+      success: true,
+      slot: outcome.slot,
+      total: LIMIT,
+      message: "Your wallet address has been submitted. Payouts are manual; no TON has been sent automatically."
+    });
+  }
 });
 
 app.use((req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(PORT, () => {
-  console.log(`TON giveaway running on port ${PORT}`);
+async function start() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS claims (
+      id BIGSERIAL PRIMARY KEY,
+      address TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("PostgreSQL connected and claims table ready.");
+
+  app.listen(PORT, () => {
+    console.log("TON giveaway running on port " + PORT);
+  });
+}
+
+start().catch(error => {
+  console.error("Server startup failed:", error.message);
+  process.exit(1);
 });
+  
